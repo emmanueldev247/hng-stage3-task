@@ -371,9 +371,17 @@ router = APIRouter()
 
 @router.post("/invoke", tags=["a2a"], response_model=JSONRPCResponse)
 def invoke(req: Request, body: JSONRPCRequest):
+    logger.info("[invoke] id=%s method=%s body=%r", body.id, body.method, body)
     try:
         if body.method == "help":
-            return as_result(body.id, HELP_TEXT)
+            resp = as_result(body.id, HELP_TEXT)
+            try:
+                logger.info("[resp] id=%s status=ok bytes=%s preview=%r",
+                            body.id, len(resp.result.content.encode("utf-8")),
+                            resp.result.content[:120])
+            except Exception:
+                logger.exception("[resp] log failed")
+            return resp
 
         # ---------- Telex A2A shape ----------
         if body.method == "message/send":
@@ -411,7 +419,7 @@ def invoke(req: Request, body: JSONRPCRequest):
             )
 
             logger.info("[telex] dbg=%s", dbg)
-            return _handle_invoke(
+            resp = _handle_invoke(
                 req=req,
                 rid=body.id,
                 user_text=text,
@@ -420,6 +428,18 @@ def invoke(req: Request, body: JSONRPCRequest):
                 temperature=temperature,
                 inline_history=inline_hist,
             )
+            try:
+                if resp.result:
+                    logger.info("[resp] id=%s status=ok bytes=%s preview=%r",
+                                body.id, len(resp.result.content.encode("utf-8")),
+                                resp.result.content[:120])
+                else:
+                    logger.info("[resp] id=%s status=err bytes=%s error=%r",
+                                body.id, len((resp.error or {}).get("message","").encode("utf-8")),
+                                resp.error)
+            except Exception:
+                logger.exception("[resp] log failed")
+            return resp
 
         if body.method != "invoke":
             return rpc_error(body.id, -32601, "Method not found")
@@ -439,7 +459,7 @@ def invoke(req: Request, body: JSONRPCRequest):
     )
     temperature = 0.7
 
-    return _handle_invoke(
+    resp = _handle_invoke(
         req=req,
         rid=body.id,
         user_text=user_text,
@@ -448,6 +468,19 @@ def invoke(req: Request, body: JSONRPCRequest):
         temperature=temperature,
         inline_history=None,
     )
+    
+    try:
+        if resp.result:
+            logger.info("[resp] id=%s status=ok bytes=%s preview=%r",
+                        body.id, len(resp.result.content.encode("utf-8")),
+                        resp.result.content[:120])
+        else:
+            logger.info("[resp] id=%s status=err bytes=%s error=%r",
+                        body.id, len((resp.error or {}).get("message","").encode("utf-8")),
+                        resp.error)
+    except Exception:
+        logger.exception("[resp] log failed")
+    return resp
 
 
 @router.post("/help", tags=["a2a"], response_model=JSONRPCResponse)
