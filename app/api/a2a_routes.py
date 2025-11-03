@@ -36,6 +36,7 @@ class JSONRPCResponse(BaseModel):
     error: Optional[dict[str, Any]] = None
 
 # ------------------------ Constants ------------------------
+
 HELP_TEXT = (
     "**CryptoSage (FastAPI) — A2A Agent**\n\n"
     "I can answer crypto questions:\n"
@@ -46,8 +47,6 @@ HELP_TEXT = (
 TTL_SHORT = getattr(Config, "CACHE_TTL_SHORT", 300)  # fallback to 5 minutes
 
 # ------------------------ Utils ------------------------
-def rpc_error(rid: Any, code: int, message: str) -> JSONRPCResponse:
-    return JSONRPCResponse(id=rid, error={"code": code, "message": message})
 
 def as_result(rid: Any, content: str) -> JSONRPCResponse:
     return JSONRPCResponse(id=rid, result=JSONRPCResult(content=content))
@@ -105,7 +104,6 @@ def _safe_set_json(key: str, value: Any, ex: int = TTL_SHORT) -> None:
     except Exception:
         logger.exception("[cache] set_json failed (non-fatal)")
 
-# Fallback Markdown for lists (only used if AI composition fails)
 def _md_top_list(title: str, coins: list[dict]) -> str:
     lines = []
     for i, c in enumerate(coins, 1):
@@ -120,6 +118,36 @@ def _md_top_list(title: str, coins: list[dict]) -> str:
         chg_str = f" ({float(chg):+,.2f}%)" if chg is not None else ""
         lines.append(f"{i}. **{name} ({sym})** — {price_str}{chg_str}")
     return f"**{title}**\n\n" + "\n".join(lines) + "\n\n_This is not financial advice._"
+
+def _ai_error_result(
+    rid: Any,
+    session_id: str,
+    user_text: str,
+    merged_history: list[dict[str, str]],
+    deployment_label: str,
+    temperature: float,
+    error: str,
+    intent: str,
+    requested_coin: Optional[str] = None,
+    data_source: Optional[str] = None,
+    extra: Optional[str] = None,
+) -> JSONRPCResponse:
+    facts = {
+        "deployment_label": deployment_label,
+        "intent": intent,
+        "error": error,
+        "requested_coin": requested_coin,
+        "data_source": data_source,
+        "extra": extra,
+    }
+    content = ai.compose_response(
+        user_text=user_text,
+        history=merged_history,
+        facts=facts,
+        temperature=temperature,
+    )
+    _append_history_safe(session_id, user_text, content)
+    return as_result(rid, content)
 
 def _handle_invoke(
     req: Request,
@@ -170,7 +198,17 @@ def _handle_invoke(
             if price is None:
                 price = cg.get_price(coin, "usd")
                 if price is None:
-                    return rpc_error(rid, 404, "Coin not found.")
+                    return _ai_error_result(
+                        rid, session_id, user_text, merged_history, deployment_label, temperature,
+                        error="coin_not_found",
+                        intent="price",
+                        requested_coin=coin,
+                        data_source="CoinGecko",
+                        extra="System logic assumed the user wants to know the price of a coin, \
+                            but the coin ID could not be resolved. [price fetch returned None]. \
+                            This likely means the coin is unknown or invalid or misspelled or \
+                            not supported or similar. The system logic could have assumed wrong so check the user text carefully.",
+                    )
                 _safe_set_json(cache_key, price, ex=300)
         except Exception:
             logger.exception("[price] fetch failed")
@@ -302,7 +340,17 @@ def _handle_invoke(
             logger.exception("[detail] fetch failed")
             detail = None
         if not detail:
-            return rpc_error(rid, 404, "Coin not found.")
+            return _ai_error_result(
+                rid, session_id, user_text, merged_history, deployment_label, temperature,
+                error="coin_not_found",
+                intent="detail",
+                requested_coin=coin,
+                data_source="CoinGecko",
+                extra="System logic assumed the user wants to know the detail of a coin, \
+                    but the coin ID could not be resolved. [detail fetch returned None]. \
+                    This likely means the coin is unknown or invalid or misspelled or \
+                    not supported or similar. The system logic could have assumed wrong so check the user text carefully.",
+            )
 
         facts = {
             "deployment_label": deployment_label, "intent": "detail",
