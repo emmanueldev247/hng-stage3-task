@@ -1,20 +1,20 @@
 import uuid
-import re
 
-from datetime import datetime
-from fastapi import APIRouter, Request
-from html import unescape
+from fastapi import APIRouter, Body, Request
 from pydantic import BaseModel, Field
-from typing import Any, Optional, Literal, List, Dict, Union
+from typing import Any, Optional, Literal, List, Dict
 
+from app.a2a.jsonrpc import make_task_result, parse_jsonrpc
+from app.a2a.telex import extract_text_and_data_master, extract_text_and_data_slave
 from app.core.config import Config
 from app.core.logger import logger
 from app.memory.session_store import SessionStore
 from app.services import ai, coingecko as cg
 from app.services.news import get_headlines
+from app.utils.aliases import resolve_coin_id
 from app.utils.cache import get_json, set_json
 from app.utils.intent import classify, extract_coin_from_price, extract_count
-from app.utils.aliases import resolve_coin_id
+
 
 class InvokeParams(BaseModel):
     text: str = Field(..., min_length=1)
@@ -23,12 +23,6 @@ class InvokeParams(BaseModel):
     org_id: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
     temperature: Optional[float] = Field(0.7, ge=0.0, le=1.0)
-
-class JSONRPCRequest(BaseModel):
-    jsonrpc: Literal["2.0"]
-    id: Any
-    method: Literal["invoke", "help", "message/send"]
-    params: Optional[Union[InvokeParams, Dict[str, Any]]] = None
 
 class JSONRPCResult(BaseModel):
     type: Literal["message"] = "message"
@@ -126,105 +120,6 @@ def _md_top_list(title: str, coins: list[dict]) -> str:
         chg_str = f" ({float(chg):+,.2f}%)" if chg is not None else ""
         lines.append(f"{i}. **{name} ({sym})** — {price_str}{chg_str}")
     return f"**{title}**\n\n" + "\n".join(lines) + "\n\n_This is not financial advice._"
-
-
-def _telex_extract_text_and_data_slave(params_obj: Dict[str, Any]) -> tuple[Optional[str], List[str], str]:
-    """
-    Returns: (effective_text, inline_history_texts, debug_summary)
-    - effective_text: parts[0].text if present, else message.text
-    - inline_history_texts: last 20 messages (strings) from parts[1].data[*].text
-    - debug_summary: short string for logs
-    """
-    eff_text = None
-    inline_hist: List[str] = []
-    dbg = []
-
-    try:
-        message = (params_obj or {}).get("message") or {}
-        parts = message.get("parts") or []
-        if isinstance(parts, list):
-            if len(parts) > 0 and isinstance(parts[0], dict) and parts[0].get("kind") == "text":
-                eff_text = (parts[0].get("text") or "").strip() or None
-                dbg.append(f"parts[0].text_len={len(eff_text or '')}")
-            if len(parts) > 1 and isinstance(parts[1], dict) and parts[1].get("kind") == "data":
-                data_items = parts[1].get("data") or []
-                for di in data_items:
-                    if isinstance(di, dict) and di.get("kind") == "text":
-                        t = (di.get("text") or "").strip()
-                        if t:
-                            inline_hist.append(t)
-                dbg.append(f"data_text_count={len(inline_hist)}")
-
-        if not eff_text:
-            e = (message.get("text") or "").strip()
-            if e:
-                eff_text = e
-                dbg.append("fallback:message.text")
-
-    except Exception:
-        logger.exception("[telex] extract failed")
-
-    return eff_text, inline_hist[-20:], ";".join(dbg[:3])
-
-_TAGS_RE = re.compile(r"<[^>]*>")
-_WS_RE   = re.compile(r"\s+")
-
-def _clean_text(raw: str) -> str:
-    if not raw:
-        return ""
-    s = unescape(raw)                     
-    s = _TAGS_RE.sub(" ", s)
-    s = _WS_RE.sub(" ", s).strip()
-    return s
-
-def _telex_extract_text_and_data_master(params_obj: Dict[str, Any]) -> tuple[Optional[str], List[str], str]:
-    """
-    Simple behavior:
-      1) Pick the LAST text from parts[1].data[*].text (cleaned).
-      2) Fallback to parts[0].text (cleaned).
-      3) Fallback to message.text (cleaned).
-    Also returns: last up to 20 cleaned texts from data (inline history), and a tiny dbg string.
-    """
-    eff_text: Optional[str] = None
-    inline_hist: List[str] = []
-    dbg_bits: List[str] = []
-
-    message = (params_obj or {}).get("message") or {}
-    parts = message.get("parts") or []
-
-    # Collect cleaned inline history from parts[1].data (if present)
-    if len(parts) > 1 and isinstance(parts[1], dict) and parts[1].get("kind") == "data":
-        data_items = parts[1].get("data") or []
-        cleaned = []
-        for di in data_items:
-            if isinstance(di, dict) and di.get("kind") == "text":
-                t = _clean_text(di.get("text") or "")
-                if t:
-                    cleaned.append(t)
-        inline_hist = cleaned[-20:]  # keep last 20
-        dbg_bits.append(f"data_text_count={len(cleaned)}")
-
-        # Choose the LAST cleaned item as the effective text
-        if inline_hist:
-            eff_text = inline_hist[-1]
-            dbg_bits.append("source=data:last")
-
-    # Fallback: parts[0].text
-    if not eff_text and len(parts) > 0 and isinstance(parts[0], dict) and parts[0].get("kind") == "text":
-        t0 = _clean_text(parts[0].get("text") or "")
-        if t0:
-            eff_text = t0
-            dbg_bits.append("source=parts0")
-
-    # Fallback: message.text
-    if not eff_text:
-        mt = _clean_text(message.get("text") or "")
-        if mt:
-            eff_text = mt
-            dbg_bits.append("source=message.text")
-
-    return eff_text, inline_hist, ";".join(dbg_bits[:3])
-
 
 def _handle_invoke(
     req: Request,
@@ -430,105 +325,82 @@ def _handle_invoke(
     _append_history_safe(session_id, user_text, content)
     return as_result(rid, content)
 
-def _wrap_as_task_response(rid: Any, content: str, context_id: str, task_id: str, state: str = "completed"):
-    return {
-        "jsonrpc": "2.0",
-        "id": rid,
-        "result": {
-            "id": task_id,
-            "contextId": context_id,
-            "status": {
-                "state": state,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "message": {
-                    "messageId": str(uuid.uuid4()),
-                    "role": "agent",
-                    "parts": [{"kind": "text", "text": content}],
-                    "kind": "message",
-                    "taskId": task_id,
-                },
-            },
-            "artifacts": [
-                {
-                    "artifactId": str(uuid.uuid4()),
-                    "name": "response",
-                    "parts": [{"kind": "text", "text": content}],
-                }
-            ],
-            "history": [
-                {
-                    "messageId": str(uuid.uuid4()),
-                    "role": "agent",
-                    "parts": [{"kind": "text", "text": content}],
-                    "kind": "message",
-                    "taskId": task_id,
-                }
-            ],
-            "kind": "task",
-        },
-    }
 # ------------------------ Router ------------------------
 
 router = APIRouter()
 
 @router.post("/invoke", tags=["a2a"])
-def invoke(req: Request, body: JSONRPCRequest):
+def invoke(req: Request, body: Any = Body(default_factory=dict)):
     logger.info("[invoke] Agent called with request body=%r", body)
     try:
-        if body.method == "help":
-            resp = as_result(body.id, HELP_TEXT)
-            try:
-                logger.info("[resp] id=%s status=ok bytes=%s preview=%r",
-                            body.id, len(resp.result.content.encode("utf-8")),
-                            resp.result.content[:120])
-            except Exception:
-                logger.exception("[resp] log failed")
+        rid, method, params = parse_jsonrpc(body)
+        if method == "help":
+            content = HELP_TEXT
+            resp = make_task_result(
+                rid, content=content,
+                context_id=str(uuid.uuid4()),
+                task_id=str(uuid.uuid4()),
+                state="completed",
+                user_echo=None,
+            )
+            logger.info("[response] Agent response=%s", resp)            
             return resp
 
         # ---------- Telex A2A shape ----------
-        if body.method == "message/send":
-            if not isinstance(body.params, dict):
-                return rpc_error(body.id, -32602, "Invalid params for message/send")
+        if method == "message/send":
+            if not isinstance(params, dict):
+                resp = make_task_result(
+                    rid,
+                    content="Invalid params for message/send.",
+                    context_id=str(uuid.uuid4()),
+                    task_id=str(uuid.uuid4()),
+                    state="failed",
+                    user_echo=None,
+                )
+                logger.info("[response] Agent response=%s", resp)            
+                return resp
 
             # Log brief snapshot of Telex parts
-            try:
-                message = (body.params or {}).get("message") or {}
-                context_id = message.get("taskId") or str(uuid.uuid4())
-                task_id    = message.get("messageId") or str(uuid.uuid4())
-                parts = message.get("parts") or []
-                logger.info("[telex] parts_count=%s kinds=%s",
-                            len(parts), [p.get("kind") for p in parts[:3] if isinstance(p, dict)])
-            except Exception:
-                logger.exception("[telex] log snapshot failed")
+            message = (params or {}).get("message") or {}
+            context_id = message.get("taskId") or str(uuid.uuid4())
+            task_id    = message.get("messageId") or str(uuid.uuid4())
+            parts = message.get("parts") or []
 
-            text, inline_hist, dbg = _telex_extract_text_and_data_master(body.params)
+            logger.info("[telex] parts_count=%s kinds=%s",
+                    len(parts), [p.get("kind") for p in parts[:3] if isinstance(p, dict)])
+
+            text, inline_hist, dbg = extract_text_and_data_master(params)
             if not text:
-                text, inline_hist, dbg = _telex_extract_text_and_data_slave(body.params)
-                if not text:
-                    logger.warning("[telex] no text extracted")
-                    return rpc_error(body.id, -32602, "No text provided in Telex message.")
+                text, inline_hist, dbg = extract_text_and_data_slave(params)
+            if not text:
+                logger.warning("[telex] no text extracted")
+                resp = make_task_result(
+                    rid,
+                    content="I didn't receive any text. Please send a crypto query.",
+                    context_id=context_id,
+                    task_id=task_id,
+                    state="completed",
+                    user_echo="",
+                )
+                logger.info("[response] Agent response=%s", resp)            
+                return resp
 
-            meta = (body.params or {}).get("metadata") or {}
+            meta = (params or {}).get("metadata") or {}
             deployment_label = (
                 req.headers.get("X-Deployment-Label")
                 or meta.get("deployment_label")
                 or Config.DEPLOYMENT_LABEL
             )
             temperature = 0.7
-
             params_like = InvokeParams(
-                text=text,
-                user_id=None,
-                org_id=None,
-                channel_id=None,
-                metadata=meta,
-                temperature=temperature
+                text=text, user_id=None, org_id=None, channel_id=None,
+                metadata=meta, temperature=temperature
             )
 
             logger.info("[telex] dbg=%s", dbg)
             resp = _handle_invoke(
                 req=req,
-                rid=body.id,
+                rid=rid,
                 user_text=text,
                 params_like=params_like,
                 deployment_label=deployment_label,
@@ -541,58 +413,47 @@ def invoke(req: Request, body: JSONRPCRequest):
                 content = resp.result.content
             else:
                 content = (resp.error or {}).get("message", "Sorry, I couldn’t process that just now.")
+
             state = "failed" if resp and resp.error else "completed"
-            wrapped = _wrap_as_task_response(body.id, content, context_id, task_id, state=state)
-            try:
-                logger.info("[response] Agent response=%s", wrapped)
-            except Exception:
-                logger.exception("[response] log failed")
-            
-            return wrapped
 
-        if body.method != "invoke":
-            return rpc_error(body.id, -32601, "Method not found")
-        if not isinstance(body.params, InvokeParams) or not body.params.text:
-            return rpc_error(body.id, -32602, "Invalid params: 'text' is required")
+            resp = make_task_result(
+                rid, content=content, context_id=context_id, task_id=task_id,
+                state=state, user_echo=text
+            )
+            logger.info("[response] Agent response=%s", resp)            
+            return resp
+
+        resp = make_task_result(
+            rid,
+            content="Unknown method. Use 'message/send' or 'help'.",
+            context_id=str(uuid.uuid4()),
+            task_id=str(uuid.uuid4()),
+            state="failed",
+            user_echo=None,
+        )
+        logger.info("[response] Agent response=%s", resp)            
+        return resp
 
     except Exception:
-        logger.exception("[invoke] invalid request envelope")
-        return rpc_error(body.id if body else None, -32603, "Internal error")
+        logger.exception("[invoke] unhandled error")
+        resp = make_task_result(
+            rid,
+            content="Internal error while handling the request.",
+            context_id=str(uuid.uuid4()),
+            task_id=str(uuid.uuid4()),
+            state="failed",
+            user_echo=None,
+        )
+        logger.info("[response] Agent response=%s", resp)            
+        return resp
 
-    params: InvokeParams = body.params
-    user_text = params.text.strip()
-    deployment_label = (
-        (params.metadata or {}).get("deployment_label")
-        or req.headers.get("X-Deployment-Label")
-        or Config.DEPLOYMENT_LABEL
+@router.post("/help", tags=["a2a"])
+def help_rpc():
+    return make_task_result(
+        rid="",
+        content=HELP_TEXT,
+        context_id=str(uuid.uuid4()),
+        task_id=str(uuid.uuid4()),
+        state="completed",
+        user_echo=None,
     )
-    temperature = 0.7
-
-    resp = _handle_invoke(
-        req=req,
-        rid=body.id,
-        user_text=user_text,
-        params_like=params,
-        deployment_label=deployment_label,
-        temperature=temperature,
-        inline_history=None,
-    )
-    
-    try:
-        if resp.result:
-            logger.info("[resp] id=%s status=ok bytes=%s preview=%r",
-                        body.id, len(resp.result.content.encode("utf-8")),
-                        resp.result.content[:120])
-        else:
-            logger.info("[resp] id=%s status=err bytes=%s error=%r",
-                        body.id, len((resp.error or {}).get("message","").encode("utf-8")),
-                        resp.error)
-    except Exception:
-        logger.exception("[resp] log failed")
-    return resp
-
-
-@router.post("/help", tags=["a2a"], response_model=JSONRPCResponse)
-def help_rpc(req: Optional[JSONRPCRequest] = None):
-    rid = None if req is None else req.id
-    return JSONRPCResponse(id=rid, result=JSONRPCResult(content=HELP_TEXT))

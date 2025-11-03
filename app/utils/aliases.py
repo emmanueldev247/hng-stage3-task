@@ -1,11 +1,12 @@
-import threading
-from typing import Dict, Optional
-
 import requests
+import threading
+
+from typing import Dict, Optional
 
 from app.core.config import Config
 from app.core.logger import logger
 from app.utils.cache import get_json, set_json
+
 
 _CACHE_KEY = "coin_aliases:v1"
 _LOCK = threading.Lock()
@@ -42,13 +43,6 @@ def _fetch_aliases() -> Dict[str, str]:
     except Exception:
         logger.exception("[aliases] fetch failed")
     return aliases
-
-def refresh_aliases() -> Dict[str, str]:
-    with _LOCK:
-        aliases = _fetch_aliases()
-        if aliases:
-            set_json(_CACHE_KEY, aliases, ex=_DEFAULT_TTL)
-        return aliases
 
 def get_aliases() -> Dict[str, str]:
     cached = get_json(_CACHE_KEY)
